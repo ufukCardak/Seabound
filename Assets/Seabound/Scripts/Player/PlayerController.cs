@@ -4,6 +4,8 @@ using Unity.Cinemachine;
 
 public class PlayerController : NetworkBehaviour
 {
+    public NetworkVariable<int> Health = new NetworkVariable<int>(100, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+
     [Header("State Management")]
     private PlayerBaseState currentState;
 
@@ -31,12 +33,22 @@ public class PlayerController : NetworkBehaviour
     public float InteractRange = 4f;
     public BoatController currentBoat;
 
+    [Header("Carrying Settings")]
+    public Transform HoldPoint;
+    public ChestController currentChest;
+
+    [Header("Combat Settings")]
+    public Transform FirePoint;
+    public GameObject BulletPrefab;
+    public float BulletSpeed = 20f;
+
     private Transform _mainCameraTransform;
 
     public PlayerIdleState IdleState = new PlayerIdleState();
     public PlayerWalkingState WalkingState = new PlayerWalkingState();
     public PlayerJumpingState JumpingState = new PlayerJumpingState();
     public PlayerDrivingState DrivingState = new PlayerDrivingState();
+    public PlayerCarryingState CarryingState = new PlayerCarryingState();
     public override void OnNetworkSpawn()
     {
         currentState = IdleState;
@@ -86,6 +98,11 @@ public class PlayerController : NetworkBehaviour
         animator.SetFloat("Speed", currentSpeed);
         animator.SetBool("IsGrounded", IsGrounded());
 
+        if (Input.GetMouseButtonDown(0))
+        {
+            FireServerRpc(FirePoint.position, FirePoint.rotation);
+        }
+
         if (Input.GetButtonDown("Jump") && IsGrounded() && currentState != JumpingState)
         {
             ChangeState(JumpingState);
@@ -97,9 +114,13 @@ public class PlayerController : NetworkBehaviour
             {
                 LeaveBoat();
             }
+            else if (currentState == CarryingState)
+            {
+                DropChest();
+            }
             else if (IsGrounded())
             {
-                TryEnterBoat();
+                TryInteract();
             }
         }
     }
@@ -112,6 +133,28 @@ public class PlayerController : NetworkBehaviour
         currentState.Exit(this);
         currentState = newState;
         currentState.Enter(this);
+    }
+    public void TakeDamage(int damage)
+    {
+        if (!IsServer) 
+            return;
+
+        Health.Value -= damage;
+
+        if (Health.Value <= 0)
+        {
+            Debug.Log("Oyuncu Öldü! (İleride buraya yeniden doğma eklenebilir)");
+        }
+    }
+    [Rpc(SendTo.Server)]
+    private void FireServerRpc(Vector3 spawnPos, Quaternion spawnRot)
+    {
+        GameObject bullet = Instantiate(BulletPrefab, spawnPos, spawnRot);
+
+        Rigidbody rb = bullet.GetComponent<Rigidbody>();
+        rb.linearVelocity = bullet.transform.forward * BulletSpeed;
+
+        bullet.GetComponent<NetworkObject>().Spawn();
     }
     public void ApplyJumpForce()
     {
@@ -150,7 +193,101 @@ public class PlayerController : NetworkBehaviour
             transform.rotation = Quaternion.Slerp(transform.rotation, targetRotation, RotationSpeed * Time.deltaTime);
         }
     }
+    private void TryInteract()
+    {
+        Collider[] hitColliders = Physics.OverlapSphere(transform.position, InteractRange);
+        foreach (var hit in hitColliders)
+        {
+            IInteractable interactable = hit.GetComponentInParent<IInteractable>();
+            if (interactable != null)
+            {
+                interactable.Interact(this);
+                return;
+            }
+            BoatController boat = hit.GetComponentInParent<BoatController>();
+            if (boat != null && !boat.IsDriven.Value)
+            {
+                RequestDriveBoatServerRpc(boat.GetComponent<NetworkObject>().NetworkObjectId);
+                return;
+            }
+        }
+    }
+    public void SellCarriedChestServer()
+    {
+        if (!IsServer) 
+            return;
 
+        if (HoldPoint.childCount > 0)
+        {
+            NetworkObject chestNetObj = HoldPoint.GetChild(0).GetComponent<NetworkObject>();
+            if (chestNetObj != null)
+            {
+                chestNetObj.Despawn();
+            }
+        }
+
+        ResetPlayerStateRpc();
+    }
+
+    [Rpc(SendTo.Everyone)]
+    public void ResetPlayerStateRpc()
+    {
+        ChangeState(IdleState);
+    }
+    public void DropChest()
+    {
+        if (currentChest != null)
+        {
+            Vector3 dropPos = transform.position + transform.forward * 1.5f;
+
+            RequestDropChestServerRpc(currentChest.GetComponent<NetworkObject>().NetworkObjectId, dropPos);
+
+            currentChest = null;
+            ChangeState(IdleState);
+        }
+    }
+
+    [ServerRpc]
+    public void RequestPickUpChestServerRpc(ulong chestId, ServerRpcParams rpcParams = default)
+    {
+        if (NetworkManager.Singleton.SpawnManager.SpawnedObjects.TryGetValue(chestId, out NetworkObject chestNetObj))
+        {
+            ChestController chest = chestNetObj.GetComponent<ChestController>();
+            if (chest != null && !chest.IsCarried.Value)
+            {
+                chest.PickUp(this);
+
+                ClientRpcParams clientRpcParams = new ClientRpcParams
+                {
+                    Send = new ClientRpcSendParams { TargetClientIds = new[] { rpcParams.Receive.SenderClientId } }
+                };
+                PickUpChestClientRpc(chestId, clientRpcParams);
+            }
+        }
+    }
+
+    [ClientRpc]
+    private void PickUpChestClientRpc(ulong chestId, ClientRpcParams rpcParams = default)
+    {
+        if (NetworkManager.Singleton.SpawnManager.SpawnedObjects.TryGetValue(chestId, out NetworkObject chestNetObj))
+        {
+            currentChest = chestNetObj.GetComponent<ChestController>();
+            ChangeState(CarryingState);
+        }
+    }
+
+    [ServerRpc]
+    public void RequestDropChestServerRpc(ulong chestId, Vector3 dropPos)
+    {
+        if (NetworkManager.Singleton.SpawnManager.SpawnedObjects.TryGetValue(chestId, out NetworkObject chestNetObj))
+        {
+            ChestController chest = chestNetObj.GetComponent<ChestController>();
+            if (chest != null)
+            {
+                chest.Drop(dropPos);
+            }
+        }
+    }
     public void StopPlayer()
     {
         Rb.linearVelocity = new Vector3(0f, Rb.linearVelocity.y, 0f);
