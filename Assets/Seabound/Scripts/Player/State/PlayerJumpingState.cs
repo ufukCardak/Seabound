@@ -2,14 +2,14 @@ using UnityEngine;
 
 public class PlayerJumpingState : PlayerBaseState
 {
-    private float _jumpTimer;
+    private float jumpTimer;
     public override void Enter(PlayerController player)
     {
         if (player.IsOwner)
             player.SyncState.Value = PlayerState.Jumping;
         player.ApplyJumpForce();
 
-        _jumpTimer = 1;
+        jumpTimer = 1;
     }
 
     public override void Update(PlayerController player)
@@ -19,9 +19,9 @@ public class PlayerJumpingState : PlayerBaseState
 
         player.MovePlayer(moveX, moveZ);
 
-        if (_jumpTimer > 0)
+        if (jumpTimer > 0)
         {
-            _jumpTimer -= Time.deltaTime;
+            jumpTimer -= Time.deltaTime;
             return;
         }
 

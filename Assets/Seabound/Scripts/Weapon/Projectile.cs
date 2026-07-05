@@ -3,42 +3,80 @@ using UnityEngine;
 
 public class Projectile : NetworkBehaviour
 {
-    public float lifeTime = 3f;
+    [SerializeField] private float lifeTime = 3f;
+    [SerializeField] private int damageAmount = 25;
 
-    public override void OnNetworkSpawn()
+public override void OnNetworkSpawn()
     {
         if (IsServer)
-        {
-            Invoke(nameof(DestroyProjectile), lifeTime);
-        }
+            Invoke(nameof(Despawn), lifeTime);
     }
 
-    private void OnCollisionEnter(Collision collision)
+private void OnCollisionEnter(Collision collision)
     {
         if (!IsServer) 
             return;
 
-        Debug.Log("collision " + collision.gameObject.name);
-
-        EnemyAI enemy = collision.gameObject.GetComponent<EnemyAI>();
-        if (enemy != null)
+        var damageable = collision.gameObject.GetComponentInParent<IDamageable>();
+        if (damageable != null)
         {
-            enemy.TakeDamage(25);
+            damageable.TakeDamage(damageAmount);
+            
+            if (OwnerClientId != NetworkManager.ServerClientId || !IsHost) 
+            {
+                ShowHitmarkerRpc(RpcTarget.Single(OwnerClientId, RpcTargetUse.Temp));
+            }
+            else
+            {
+                ShowHitmarkerRpc(RpcTarget.Single(OwnerClientId, RpcTargetUse.Temp));
+            }
+
+            Transform attacker = GetPlayerByClientId(OwnerClientId);
+            if (attacker != null)
+            {
+                var ai = collision.gameObject.GetComponentInParent<EnemyAIBase>();
+                if (ai != null)
+                {
+                    ai.OnAttackedBy(attacker);
+                }
+                
+                var boat = collision.gameObject.GetComponentInParent<BoatController>();
+                if (boat != null)
+                {
+                    var allGuards = FindObjectsByType<EnemyGuardAI>(FindObjectsSortMode.None);
+                    foreach (var g in allGuards)
+                    {
+                        if (g.AssignedBoat == boat)
+                            g.OnAttackedBy(attacker);
+                    }
+                }
+            }
         }
 
-        PlayerController player = collision.gameObject.GetComponent<PlayerController>();
-        if (player != null)
-        {
-            player.TakeDamage(10);
-        }
-        DestroyProjectile();
+        Despawn();
     }
 
-    private void DestroyProjectile()
+    private Transform GetPlayerByClientId(ulong clientId)
     {
-        if (NetworkObject.IsSpawned)
+        foreach (var p in EnemyTargetRegistry.Players)
         {
-            NetworkObject.Despawn();
+            if (p != null && p.TryGetComponent<NetworkObject>(out var no))
+            {
+                if (no.OwnerClientId == clientId) return p;
+            }
         }
+        return null;
+    }
+
+    [Rpc(SendTo.SpecifiedInParams)]
+    private void ShowHitmarkerRpc(RpcParams rpcParams)
+    {
+        if (HUDManager.Instance != null)
+            HUDManager.Instance.ShowHitmarker();
+    }
+
+private void Despawn()
+    {
+        NetworkObject.Despawn();
     }
 }

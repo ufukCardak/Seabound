@@ -1,13 +1,20 @@
 using Unity.Netcode;
 using UnityEngine;
+using System;
 using Unity.Cinemachine;
 
-public class PlayerController : NetworkBehaviour
+public class PlayerController : NetworkBehaviour, IDamageable
 {
-    public NetworkVariable<int> Health = new NetworkVariable<int>(100, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
 
-    [Header("State Management")]
-    private PlayerBaseState currentState;
+    public NetworkVariable<int> Health = new NetworkVariable<int>(
+        100,
+        NetworkVariableReadPermission.Everyone,
+        NetworkVariableWritePermission.Server
+    );
+
+    public int CurrentHealth => Health.Value;
+    public event Action<int> OnHealthChanged;
+    public event Action OnDeath;
 
     public NetworkVariable<PlayerState> SyncState = new NetworkVariable<PlayerState>(
         PlayerState.Idle,
@@ -15,348 +22,233 @@ public class PlayerController : NetworkBehaviour
         NetworkVariableWritePermission.Owner
     );
 
-    [Header("Components")]
+[Header("Components")]
     public Rigidbody Rb;
     public CapsuleCollider Capsule;
-    public Animator animator;
+    public Animator Animator;
 
-    [Header("Movement Settings")]
-    public float Speed = 5f;
-    public float RotationSpeed = 10f;
-    public float JumpForce = 5f;
-
-    [Header("Grounded Settings")]
-    [SerializeField] private LayerMask groundLayer;
-    [SerializeField] private float groundCheckDistance = 0.2f;
-
-    [Header("Boat Interaction")]
-    public float InteractRange = 4f;
-    public BoatController currentBoat;
-
-    [Header("Carrying Settings")]
+    [Header("Carry Point")]
     public Transform HoldPoint;
-    public ChestController currentChest;
 
-    [Header("Combat Settings")]
-    public Transform FirePoint;
-    public GameObject BulletPrefab;
-    public float BulletSpeed = 20f;
+public PlayerMovement Movement;
+    public WeaponComponent Weapon;
+    public PlayerBoatInteraction BoatInteraction;
+    public PlayerChestInteraction ChestInteraction;
+    public PlayerInteraction Detector;
+    public LayerMask interactLayer = 1 << 8;
 
-    private Transform _mainCameraTransform;
+public readonly PlayerIdleState IdleState = new PlayerIdleState();
+    public readonly PlayerWalkingState WalkingState = new PlayerWalkingState();
+    public readonly PlayerJumpingState JumpingState = new PlayerJumpingState();
+    public readonly PlayerDrivingState DrivingState = new PlayerDrivingState();
+    public readonly PlayerCarryingState CarryingState = new PlayerCarryingState();
+    public readonly PlayerPassengerState PassengerState = new PlayerPassengerState();
+    public readonly PlayerDeadState DeadState = new PlayerDeadState();
 
-    public PlayerIdleState IdleState = new PlayerIdleState();
-    public PlayerWalkingState WalkingState = new PlayerWalkingState();
-    public PlayerJumpingState JumpingState = new PlayerJumpingState();
-    public PlayerDrivingState DrivingState = new PlayerDrivingState();
-    public PlayerCarryingState CarryingState = new PlayerCarryingState();
+    public PlayerBaseState CurrentState;
+
+public BoatController CurrentBoat;
+    public ChestController CurrentChest;
+
+private void Awake()
+    {
+        Movement = GetComponent<PlayerMovement>();
+        Weapon = GetComponent<WeaponComponent>();
+        BoatInteraction = GetComponent<PlayerBoatInteraction>();
+        ChestInteraction = GetComponent<PlayerChestInteraction>();
+        Detector = GetComponent<PlayerInteraction>();
+    }
+
     public override void OnNetworkSpawn()
     {
-        currentState = IdleState;
+        base.OnNetworkSpawn();
 
-        if (!IsOwner)
-            return;
-
-        GameObject[] spawnPoints = GameObject.FindGameObjectsWithTag("SpawnPoint");
-        if (spawnPoints.Length > 0)
+        if (IsOwner)
         {
-            int randomIndex = Random.Range(0, spawnPoints.Length);
-            Transform spawnTransform = spawnPoints[randomIndex].transform;
-
-            transform.position = spawnTransform.position;
-            transform.rotation = spawnTransform.rotation;
-
-            if (Rb != null)
+            if (HUDManager.Instance != null)
             {
-                Rb.position = spawnTransform.position;
-                Rb.rotation = spawnTransform.rotation;
+                HUDManager.Instance.Init(this);
             }
         }
 
-        currentState.Enter(this);
-        if (Camera.main != null)
+        var inventory = GetComponent<PlayerInventory>();
+        if (inventory != null)
         {
-            _mainCameraTransform = Camera.main.transform;
+            inventory.OnWeaponChanged += Weapon.EquipWeaponByIndex;
+            Weapon.EquipWeaponByIndex(inventory.EquippedWeaponIndex.Value);
         }
 
-        var camController = GameObject.FindAnyObjectByType<CameraController>();
-        if (camController != null)
+        ChangeState(IdleState);
+
+        EnemyTargetRegistry.Register(transform);
+
+        if (!IsOwner) 
+            return;
+
+        CurrentState.Enter(this);
+
+        Transform spawnPoint = SpawnManager.Instance != null
+            ? SpawnManager.Instance.GetRandomSpawnPoint()
+            : null;
+
+        if (spawnPoint != null)
         {
-            camController.Target = this.transform;
+            transform.SetPositionAndRotation(spawnPoint.position, spawnPoint.rotation);
+            Rb.position = spawnPoint.position; 
+            Rb.rotation = spawnPoint.rotation;
+        }
+
+        Movement.SetCamera(Camera.main.transform);
+
+        var cam = FindAnyObjectByType<CameraController>();
+        cam.Target = transform;
+    }
+
+    public override void OnNetworkDespawn()
+    {
+        EnemyTargetRegistry.Unregister(transform);
+        
+        var inventory = GetComponent<PlayerInventory>();
+        if (inventory != null)
+        {
+            inventory.OnWeaponChanged -= Weapon.EquipWeaponByIndex;
         }
     }
 
     private void Update()
     {
-        if (!IsOwner) 
-            return;
-
-        currentState.Update(this);
-
-        Vector3 horizontalVelocity = new Vector3(Rb.linearVelocity.x, 0f, Rb.linearVelocity.z);
-        float currentSpeed = horizontalVelocity.magnitude;
-
-        animator.SetFloat("Speed", currentSpeed);
-        animator.SetBool("IsGrounded", IsGrounded());
-
-        if (Input.GetMouseButtonDown(0))
+        if (CurrentState == DrivingState && CurrentBoat != null)
         {
-            FireServerRpc(FirePoint.position, FirePoint.rotation);
+            transform.position = CurrentBoat.HelmPosition.position;
+            transform.rotation = CurrentBoat.HelmPosition.rotation;
+        }
+        else if (CurrentState == PassengerState && CurrentBoat != null)
+        {
+            var seat = CurrentBoat.PassengerSeatPosition;
+            if (seat != null)
+            {
+                transform.position = seat.position;
+                transform.rotation = seat.rotation;
+            }
         }
 
-        if (Input.GetButtonDown("Jump") && IsGrounded() && currentState != JumpingState)
-        {
-            ChangeState(JumpingState);
-        }
+        if (!IsOwner) return;
 
-        if (Input.GetKeyDown(KeyCode.F))
+        CurrentState.Update(this);
+
+        Animator.SetFloat("Speed", Movement.HorizontalSpeed);
+        Animator.SetBool("IsGrounded", Movement.IsGrounded());
+
+        var aimIK = GetComponent<PlayerAimIK>();
+        if (aimIK != null && Camera.main != null)
         {
-            if (currentState == DrivingState)
+            Vector3 targetPos = Camera.main.transform.position + Camera.main.transform.forward * 50f;
+            bool canAim = CurrentState == IdleState || CurrentState == WalkingState;
+            bool isAiming = Input.GetMouseButton(1) && canAim;
+            aimIK.SetAimInput(targetPos, isAiming);
+
+            if (isAiming)
             {
-                LeaveBoat();
+                Movement.SpeedMultiplier = 0.5f;
             }
-            else if (currentState == CarryingState)
+            else
             {
-                DropChest();
-            }
-            else if (IsGrounded())
-            {
-                TryInteract();
+
+                Movement.SpeedMultiplier = (CurrentState == CarryingState) ? 0.5f : 1f;
             }
         }
     }
 
-    public void ChangeState(PlayerBaseState newState)
+public bool IsUIOpen()
     {
-        if (currentState == newState)
-            return;
-
-        currentState.Exit(this);
-        currentState = newState;
-        currentState.Enter(this);
+        if (ShopUIManager.Instance != null && ShopUIManager.Instance.shopPanel != null && ShopUIManager.Instance.shopPanel.activeSelf) return true;
+        if (HUDManager.Instance != null && HUDManager.Instance.inventoryPanel != null && HUDManager.Instance.inventoryPanel.activeSelf) return true;
+        return false;
     }
-    public void TakeDamage(int damage)
-    {
-        if (!IsServer) 
-            return;
 
-        Health.Value -= damage;
+public void ChangeState(PlayerBaseState newState)
+    {
+        if (CurrentState == newState) return;
+
+        CurrentState?.Exit(this);
+        CurrentState = newState;
+        CurrentState.Enter(this);
+    }
+
+public void SetCurrentBoat(BoatController boat) => CurrentBoat = boat;
+    public void SetCurrentChest(ChestController chest) => CurrentChest = chest;
+
+public void TakeDamage(int damage)
+    {
+        if (!IsServer) return;
+
+        Health.Value = Mathf.Max(0, Health.Value - damage);
 
         if (Health.Value <= 0)
+            TriggerDeathClientRpc();
+        else
+            TakeDamageClientRpc();
+    }
+
+    [ClientRpc]
+    private void TakeDamageClientRpc()
+    {
+        if (IsOwner && CameraController.Instance != null)
         {
-            Debug.Log("Oyuncu Öldü! (İleride buraya yeniden doğma eklenebilir)");
+            CameraController.Instance.AddDamageShake();
         }
     }
-    [Rpc(SendTo.Server)]
-    private void FireServerRpc(Vector3 spawnPos, Quaternion spawnRot)
+
+    [ClientRpc]
+    private void TriggerDeathClientRpc() => ChangeState(DeadState);
+
+    [Rpc(SendTo.Server, InvokePermission = RpcInvokePermission.Everyone)]
+    public void RespawnServerRpc()
     {
-        GameObject bullet = Instantiate(BulletPrefab, spawnPos, spawnRot);
+        Health.Value = 100;
 
-        Rigidbody rb = bullet.GetComponent<Rigidbody>();
-        rb.linearVelocity = bullet.transform.forward * BulletSpeed;
+        Transform sp = SpawnManager.Instance.GetRandomSpawnPoint();
+        Vector3 pos;
+        Quaternion rot;
 
-        bullet.GetComponent<NetworkObject>().Spawn();
-    }
-    public void ApplyJumpForce()
-    {
-        Rb.linearVelocity = new Vector3(Rb.linearVelocity.x, 0f, Rb.linearVelocity.z);
-        Rb.AddForce(Vector3.up * JumpForce, ForceMode.Impulse);
-
-        animator.SetTrigger("JumpTrigger");
-    }
-    public bool IsGrounded()
-    {
-        Vector3 rayOrigin = transform.position + Vector3.up * 0.1f;
-
-        bool hit = Physics.Raycast(rayOrigin, Vector3.down, groundCheckDistance + 0.1f, groundLayer);
-
-        Debug.DrawRay(rayOrigin, Vector3.down * (groundCheckDistance + 0.1f), hit ? Color.green : Color.red);
-
-        return hit;
-    }
-    public void MovePlayer(float moveX, float moveZ)
-    {
-        Vector3 camForward = _mainCameraTransform.forward;
-        camForward.y = 0;
-        camForward.Normalize();
-
-        Vector3 camRight = _mainCameraTransform.right;
-        camRight.y = 0;
-        camRight.Normalize();
-
-        Vector3 moveDirection = (camRight * moveX + camForward * moveZ).normalized;
-        Vector3 targetVelocity = moveDirection * Speed;
-        Rb.linearVelocity = new Vector3(targetVelocity.x, Rb.linearVelocity.y, targetVelocity.z);
-
-        if (moveDirection != Vector3.zero)
+        if (sp != null)
         {
-            Quaternion targetRotation = Quaternion.LookRotation(moveDirection);
-            transform.rotation = Quaternion.Slerp(transform.rotation, targetRotation, RotationSpeed * Time.deltaTime);
+            pos = sp.position;
+            rot = sp.rotation;
         }
-    }
-    private void TryInteract()
-    {
-        Collider[] hitColliders = Physics.OverlapSphere(transform.position, InteractRange);
-        foreach (var hit in hitColliders)
+        else
         {
-            IInteractable interactable = hit.GetComponentInParent<IInteractable>();
-            if (interactable != null)
-            {
-                interactable.Interact(this);
-                return;
-            }
-            BoatController boat = hit.GetComponentInParent<BoatController>();
-            if (boat != null && !boat.IsDriven.Value)
-            {
-                RequestDriveBoatServerRpc(boat.GetComponent<NetworkObject>().NetworkObjectId);
-                return;
-            }
-        }
-    }
-    public void SellCarriedChestServer()
-    {
-        if (!IsServer) 
-            return;
-
-        if (HoldPoint.childCount > 0)
-        {
-            NetworkObject chestNetObj = HoldPoint.GetChild(0).GetComponent<NetworkObject>();
-            if (chestNetObj != null)
-            {
-                chestNetObj.Despawn();
-            }
+            pos = Vector3.zero;
+            rot = Quaternion.identity;
         }
 
-        ResetPlayerStateRpc();
+        TeleportClientRpc(pos, rot);
     }
 
-    [Rpc(SendTo.Everyone)]
-    public void ResetPlayerStateRpc()
+    [ClientRpc]
+    private void TeleportClientRpc(Vector3 pos, Quaternion rot)
     {
+        transform.SetPositionAndRotation(pos, rot);
+        Rb.position = pos; 
+        Rb.rotation = rot; 
+        Rb.linearVelocity = Vector3.zero;
         ChangeState(IdleState);
     }
-    public void DropChest()
+
+public void StopPlayer() => Movement.Stop();
+    public void ApplyJumpForce() { Movement.TryJump(); Animator.SetTrigger("JumpTrigger"); }
+    public bool IsGrounded() => Movement.IsGrounded();
+
+    public void MovePlayer(float x, float z) => Movement.Move(x, z);
+
+    public void IgnoreBoatCollisions(BoatController boat, bool ignore)
     {
-        if (currentChest != null)
+        if (boat == null || Capsule == null) return;
+        var boatColliders = boat.GetComponentsInChildren<Collider>();
+        foreach (var bc in boatColliders)
         {
-            Vector3 dropPos = transform.position + transform.forward * 1.5f;
-
-            RequestDropChestServerRpc(currentChest.GetComponent<NetworkObject>().NetworkObjectId, dropPos);
-
-            currentChest = null;
-            ChangeState(IdleState);
+            Physics.IgnoreCollision(Capsule, bc, ignore);
         }
     }
 
-    [ServerRpc]
-    public void RequestPickUpChestServerRpc(ulong chestId, ServerRpcParams rpcParams = default)
-    {
-        if (NetworkManager.Singleton.SpawnManager.SpawnedObjects.TryGetValue(chestId, out NetworkObject chestNetObj))
-        {
-            ChestController chest = chestNetObj.GetComponent<ChestController>();
-            if (chest != null && !chest.IsCarried.Value)
-            {
-                chest.PickUp(this);
-
-                ClientRpcParams clientRpcParams = new ClientRpcParams
-                {
-                    Send = new ClientRpcSendParams { TargetClientIds = new[] { rpcParams.Receive.SenderClientId } }
-                };
-                PickUpChestClientRpc(chestId, clientRpcParams);
-            }
-        }
-    }
-
-    [ClientRpc]
-    private void PickUpChestClientRpc(ulong chestId, ClientRpcParams rpcParams = default)
-    {
-        if (NetworkManager.Singleton.SpawnManager.SpawnedObjects.TryGetValue(chestId, out NetworkObject chestNetObj))
-        {
-            currentChest = chestNetObj.GetComponent<ChestController>();
-            ChangeState(CarryingState);
-        }
-    }
-
-    [ServerRpc]
-    public void RequestDropChestServerRpc(ulong chestId, Vector3 dropPos)
-    {
-        if (NetworkManager.Singleton.SpawnManager.SpawnedObjects.TryGetValue(chestId, out NetworkObject chestNetObj))
-        {
-            ChestController chest = chestNetObj.GetComponent<ChestController>();
-            if (chest != null)
-            {
-                chest.Drop(dropPos);
-            }
-        }
-    }
-    public void StopPlayer()
-    {
-        Rb.linearVelocity = new Vector3(0f, Rb.linearVelocity.y, 0f);
-    }
-    private void TryEnterBoat()
-    {
-        Collider[] hitColliders = Physics.OverlapSphere(transform.position, InteractRange);
-        foreach (var hit in hitColliders)
-        {
-            BoatController boat = hit.GetComponentInParent<BoatController>();
-            if (boat != null && !boat.IsDriven.Value)
-            {
-                RequestDriveBoatServerRpc(boat.GetComponent<NetworkObject>().NetworkObjectId);
-                break;
-            }
-        }
-    }
-
-    private void LeaveBoat()
-    {
-        if (currentBoat != null)
-        {
-            RequestLeaveBoatServerRpc(currentBoat.GetComponent<NetworkObject>().NetworkObjectId);
-        }
-    }
-
-    [ServerRpc]
-    private void RequestDriveBoatServerRpc(ulong boatNetworkObjectId, ServerRpcParams rpcParams = default)
-    {
-        if (NetworkManager.Singleton.SpawnManager.SpawnedObjects.TryGetValue(boatNetworkObjectId, out NetworkObject boatNetObj))
-        {
-            BoatController boat = boatNetObj.GetComponent<BoatController>();
-            if (boat != null && !boat.IsDriven.Value)
-            {
-                boat.StartDriving(rpcParams.Receive.SenderClientId);
-
-                EnterBoatClientRpc(boatNetworkObjectId);
-            }
-        }
-    }
-
-    [ServerRpc]
-    private void RequestLeaveBoatServerRpc(ulong boatNetworkObjectId)
-    {
-        if (NetworkManager.Singleton.SpawnManager.SpawnedObjects.TryGetValue(boatNetworkObjectId, out NetworkObject boatNetObj))
-        {
-            BoatController boat = boatNetObj.GetComponent<BoatController>();
-            if (boat != null)
-            {
-                boat.StopDriving();
-                LeaveBoatClientRpc();
-            }
-        }
-    }
-
-    [ClientRpc]
-    private void EnterBoatClientRpc(ulong boatNetworkObjectId)
-    {
-        if (NetworkManager.Singleton.SpawnManager.SpawnedObjects.TryGetValue(boatNetworkObjectId, out NetworkObject boatNetObj))
-        {
-            currentBoat = boatNetObj.GetComponent<BoatController>();
-            ChangeState(DrivingState);
-        }
-    }
-
-    [ClientRpc]
-    private void LeaveBoatClientRpc()
-    {
-        currentBoat = null;
-        ChangeState(IdleState);
-    }
 }

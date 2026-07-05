@@ -4,5 +4,8 @@ public enum PlayerState
     Walking,
     Jumping,
     Falling,
-    InBoat
+    InBoat,
+    Carrying,
+    Passenger,
+    Dead
 }

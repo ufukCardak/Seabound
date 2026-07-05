@@ -1,117 +1,68 @@
 using Unity.Netcode;
 using UnityEngine;
 
-public class EnemyAI : NetworkBehaviour
+public class EnemyAI : EnemyAIBase
 {
-    public NetworkVariable<int> Health = new NetworkVariable<int>(100, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+    [Header("Stats")]
+    [SerializeField] private EnemyStatsSO stats;
 
-    [Header("Turret (Nişancı) Ayarları")]
-    public float rotationSpeed = 5f;
-    public float detectionRange = 15f;
-    public float attackRate = 1f;
+    [Header("Combat")]
+    [SerializeField] private GameObject projectilePrefab;
+    [SerializeField] private Transform firePoint;
 
-    [Header("Silah Ayarları")]
-    public GameObject projectilePrefab; // Fırlatılacak mermi prefabı
-    public Transform firePoint;         // Merminin çıkacağı namlu ucu
-    public float projectileSpeed = 20f; // Merminin uçuş hızı
+    protected override float DetectionRange => stats.alertRange;
+    private float rotationSpeed => stats.rotationSpeed;
+    private float projectileSpeed => stats.projectileSpeed;
+    private float attackRate => stats.attackRate;
 
-    private Transform targetPlayer;
+    private float nextAttackTime;
     private Quaternion initialLocalRotation;
-    private float nextAttackTime = 0f;
+    private HealthComponent health;
 
-    private void Start()
+    private void Awake()
     {
+        health = GetComponent<HealthComponent>();
         initialLocalRotation = transform.localRotation;
     }
 
-    private void Update()
+    private void OnEnable()
     {
-        if (!IsServer) return;
+        if (health != null) health.OnDeath += HandleDeath;
+    }
 
-        FindNearestPlayer();
+    private void OnDisable()
+    {
+        if (health != null) health.OnDeath -= HandleDeath;
+    }
 
-        // --- OYUNCU MENZİLDEYSE ---
-        if (targetPlayer != null)
+    protected override void Tick()
+    {
+        if (Target != null)
         {
-            Vector3 directionToPlayer = (targetPlayer.position - transform.position).normalized;
-            directionToPlayer.y = 0;
+            FaceTarget(Target.position, rotationSpeed);
 
-            if (directionToPlayer != Vector3.zero)
-            {
-                Quaternion lookRot = Quaternion.LookRotation(directionToPlayer);
-                transform.rotation = Quaternion.Slerp(transform.rotation, lookRot, Time.deltaTime * rotationSpeed);
-            }
-
-            // Ateş etme süresi geldiyse ateş et
             if (Time.time >= nextAttackTime)
             {
-                ShootTarget();
+                Vector3 targetPos = Target.position + Vector3.up * 1f;
+                Vector3 direction = (targetPos - firePoint.position).normalized;
+                PerformHitscanAttack(firePoint, stats.attackRange, stats.attackDamage, direction);
                 nextAttackTime = Time.time + (1f / attackRate);
             }
         }
-        // --- OYUNCU YOKSA ---
         else
         {
-            transform.localRotation = Quaternion.Slerp(transform.localRotation, initialLocalRotation, Time.deltaTime * rotationSpeed);
+            transform.localRotation = Quaternion.Slerp(
+                transform.localRotation,
+                initialLocalRotation,
+                rotationSpeed * Time.fixedDeltaTime);
         }
     }
 
-    private void FindNearestPlayer()
+    public void TakeDamage(int damage) => health?.TakeDamage(damage);
+
+    private void HandleDeath()
     {
-        GameObject[] players = GameObject.FindGameObjectsWithTag("Player");
-        float closestDistance = Mathf.Infinity;
-        targetPlayer = null;
-
-        foreach (GameObject player in players)
-        {
-            float distance = Vector3.Distance(transform.position, player.transform.position);
-
-            if (distance <= detectionRange)
-            {
-                if (distance < closestDistance)
-                {
-                    closestDistance = distance;
-                    targetPlayer = player.transform;
-                }
-            }
-        }
-    }
-
-    private void ShootTarget()
-    {
-        // 1. Güvenlik Kontrolü: Prefab veya namlu ucu atanmamışsa hata verip durdur
-        if (projectilePrefab == null || firePoint == null)
-        {
-            Debug.LogWarning("EnemyAI: Projectile Prefab veya FirePoint atanmamış!");
-            return;
-        }
-
-        // 2. Mermiyi sunucuda tam namlunun ucunda yarat
-        GameObject projectile = Instantiate(projectilePrefab, firePoint.position, firePoint.rotation);
-
-        // 3. Ağdaki (Network) diğer tüm oyuncuların ekranında da görünmesini sağla
-        NetworkObject netObj = projectile.GetComponent<NetworkObject>();
-        if (netObj != null)
-        {
-            netObj.Spawn();
-        }
-
-        // 4. Mermiye fiziksel bir itiş gücü (hız) ver
-        Rigidbody rb = projectile.GetComponent<Rigidbody>();
-        if (rb != null)
-        {
-            rb.linearVelocity = firePoint.forward * projectileSpeed;
-        }
-    }
-
-    public void TakeDamage(int damage)
-    {
-        if (!IsServer) return;
-        Health.Value -= damage;
-
-        if (Health.Value <= 0 && NetworkObject.IsSpawned)
-        {
+        if (IsServer && NetworkObject.IsSpawned)
             NetworkObject.Despawn();
-        }
     }
 }
